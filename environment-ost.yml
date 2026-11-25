@@ -1,0 +1,7 @@
+# Separate conda env for OpenStructure (lDDT). Built by scripts/install_ost.sh
+name: ost
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - openstructure

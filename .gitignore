@@ -222,3 +222,5 @@ __marimo__/
 # Project data
 data/structures/
 data/predictions/
+# External tools (built locally by scripts/install_tmscore.sh)
+tools/
