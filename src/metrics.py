@@ -1,14 +1,19 @@
+"""Structural evaluation metrics (RMSD, TM-score, GDT_TS, lDDT) and CSV export."""
+
 import json
 import re
 import subprocess
 import tempfile
 from pathlib import Path
+import csv
 
+from structure_io import read_structure_as_pdb
 from pdb_validation import validate_pdb
 
 TOOLS_DIR = Path(__file__).resolve().parent.parent / "tools"
 TMSCORE = TOOLS_DIR / "TMscore"
-OST = TOOLS_DIR / "ost-env" / "bin" / "ost"
+OST_PYTHON = TOOLS_DIR / "ost-env" / "bin" / "python"
+OST_WORKER = Path(__file__).resolve().parent / "ost_lddt_worker.py"
 
 _TMSCORE_PATTERNS = {
     "rmsd": r"RMSD of\s+the common residues=\s*([\d.]+)",
@@ -70,49 +75,95 @@ def tm_score(pred_pdb, native_pdb, timeout=60):
 
 def lddt_score(pred_pdb, native_pdb, timeout=300):
     """
-    Computes lDDT of a predicted structure against the ground truth with OpenStructure.
-    Only CA atoms are used (--bb-lddt).
-
-    Args:
-        pred_pdb: PDB-format text (CA-only) of the prediction.
-        native_pdb: PDB-format text (CA-only) of the ground truth.
-
-    Returns:
-        lDDT in the range [0, 1]. Higher is better.
+    Computes CA-only lDDT of a predicted structure against the ground truth
+    using OpenStructure's lDDTScorer (bb_only=True).
     """
-    if not OST.exists():
-        raise FileNotFoundError(f"{OST} not found, run scripts/install_ost.sh")
+    if not OST_PYTHON.exists():
+        raise FileNotFoundError(f"{OST_PYTHON} not found, run scripts/install_ost.sh")
     _validate_pair(pred_pdb, native_pdb)
 
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
-        (tmp / "pred.pdb").write_text(pred_pdb)
-        (tmp / "native.pdb").write_text(native_pdb)
+        pred_path = tmp / "pred.pdb"
+        native_path = tmp / "native.pdb"
+        pred_path.write_text(pred_pdb)
+        native_path.write_text(native_pdb)
+
         result = subprocess.run(
-            [
-                str(OST),
-                "compare-structures",
-                "-m",
-                str(tmp / "pred.pdb"),
-                "-r",
-                str(tmp / "native.pdb"),
-                "-o",
-                str(tmp / "out.json"),
-                "--residue-number-alignment",  # residues are numbered 1..L in both files
-                "--bb-lddt",  # lDDT on CA atoms only
-                "--lddt-no-stereochecks",  # CA-only files have no side chains to check
-            ],
+            [str(OST_PYTHON), str(OST_WORKER), str(pred_path), str(native_path)],
             capture_output=True,
             text=True,
             timeout=timeout,
         )
-        out_path = tmp / "out.json"
-        if not out_path.exists():
-            raise RuntimeError(
-                f"OpenStructure produced no output (exit {result.returncode}):\n{result.stderr}"
-            )
-        data = json.loads(out_path.read_text())
 
-    if data.get("status") != "SUCCESS":
-        raise RuntimeError(f"OpenStructure failed:\n{data.get('traceback')}")
-    return data["bb_lddt"]
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"OpenStructure lDDTScorer failed (exit {result.returncode}):\n{result.stderr}"
+        )
+
+    lines = [line for line in result.stdout.splitlines() if line.strip()]
+    if not lines:
+        raise RuntimeError(f"OpenStructure produced no output:\n{result.stderr}")
+
+    data = json.loads(lines[-1])
+    raw_lddt = data.get("lddt")
+    if isinstance(raw_lddt, list):
+        raw_lddt = raw_lddt[0]
+    if raw_lddt is None:
+        raise RuntimeError("OpenStructure lDDTScorer returned None (too few CA contacts)")
+    return float(raw_lddt)
+
+
+def evaluate_pair(pred_pdb: str, native_pdb: str) -> dict[str, float]:
+    """Compute RMSD, TM_score, GDT_TS, and lDDT for a single structure pair."""
+    tm = tm_score(pred_pdb, native_pdb)
+    lddt = lddt_score(pred_pdb, native_pdb)
+    return {
+        "RMSD": tm["rmsd"],
+        "TM_score": tm["tm_score"],
+        "GDT_TS": tm["gdt_ts"],
+        "lDDT": lddt,
+    }
+
+
+def evaluate_predictions(
+    pred_dir: str | Path,
+    ref_dir: str | Path,
+    output_csv: str | Path,
+) -> list[dict[str, object]]:
+    """Compare all predicted PDBs in `pred_dir` against `ref_dir` and write results to CSV."""
+    pred_dir = Path(pred_dir)
+    ref_dir = Path(ref_dir)
+    output_csv = Path(output_csv)
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+
+    pred_files = sorted(pred_dir.glob("*.pdb"))
+    if not pred_files:
+        raise FileNotFoundError(f"No predicted .pdb files found in {pred_dir}")
+
+    rows: list[dict[str, object]] = []
+    for pred_path in pred_files:
+        protein_id = pred_path.stem
+        ref_path = ref_dir / f"{protein_id}.pdb"
+        if not ref_path.exists():
+            ref_path = ref_dir / f"{protein_id}.cif"
+        if not ref_path.exists():
+            raise FileNotFoundError(f"Missing reference for {protein_id} in {ref_dir}")
+
+        try:
+            scores = evaluate_pair(
+                read_structure_as_pdb(pred_path),
+                read_structure_as_pdb(ref_path),
+            )
+            rows.append({"proteinID": protein_id, **scores})
+        except Exception as e:
+            print(f"[FAILED] {protein_id}: {e}")
+
+    fieldnames = ["proteinID", "RMSD", "TM_score", "GDT_TS", "lDDT"]
+    with output_csv.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print(f"Saved {len(rows)} evaluation rows to {output_csv}")
+    return rows
